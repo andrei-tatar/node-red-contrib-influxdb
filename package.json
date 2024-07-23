@@ -4,6 +4,7 @@
   "description": "Node-RED nodes to save and query data from an influxdb time series database",
   "main": "influxdb.js",
   "scripts": {
+    "pub": "npm publish --access=public --registry https://registry.npmjs.org/",
     "test": "echo \"Error: no test specified yet!\" && exit 1"
   },
   "repository": {
