@@ -1,16 +1,16 @@
 var _ = require('lodash');
 
+/** @typedef {{client: import('@influxdata/influxdb-client').InfluxDB}} ConfigNodeType */
+/** @typedef {{client: import('@influxdata/influxdb-client').WriteApi, influxdbConfig: ConfigNodeType} OutNodeType */
+
 module.exports = function (RED) {
     "use strict";
-    var Influx = require('influx');
-    var { InfluxDB, Point } = require('@influxdata/influxdb-client');
-
-    const VERSION_1X = '1.x';
-    const VERSION_18_FLUX = '1.8-flux';
-    const VERSION_20 = '2.0';
+    var { InfluxDB, Point, InfluxDB } = require('@influxdata/influxdb-client');
+    const crypto = require('node:crypto');
 
     /**
      * Config node. Currently we only connect to one host.
+     * @this ConfigNodeType
      */
     function InfluxConfigNode(n) {
         RED.nodes.createNode(this, n);
@@ -19,55 +19,23 @@ module.exports = function (RED) {
         this.database = n.database;
         this.name = n.name;
 
+        /** @type {import('@influxdata/influxdb-client').ClientOptions} */
         var clientOptions = null;
-        
-        if (!n.influxdbVersion) {
-            n.influxdbVersion = VERSION_1X;
+
+        const timeout = Math.floor(+(n.timeout ? n.timeout : 10) * 1000) // convert from seconds to milliseconds
+        const token = this.credentials.token;
+
+        clientOptions = {
+            url: n.url,
+            token,
+            timeout,
+            rejectUnauthorized: n.rejectUnauthorized,
+            writeOptions: {
+                maxBufferLines: 2,
+                maxRetryTime: 30000,
+            }
         }
-
-        if (n.influxdbVersion === VERSION_1X) {
-            this.usetls = n.usetls;
-            if (typeof this.usetls === 'undefined') {
-                this.usetls = false;
-            }
-            // for backward compatibility with old 'protocol' setting
-            if (n.protocol === 'https') {
-                this.usetls = true;
-            }
-            if (this.usetls && n.tls) {
-                var tlsNode = RED.nodes.getNode(n.tls);
-                if (tlsNode) {
-                    this.hostOptions = {};
-                    tlsNode.addTLSOptions(this.hostOptions);
-                }
-            }
-            this.client = new Influx.InfluxDB({
-                hosts: [{
-                    host: this.hostname,
-                    port: this.port,
-                    protocol: this.usetls ? "https" : "http",
-                    options: this.hostOptions
-                }],
-                database: this.database,
-                username: this.credentials.username,
-                password: this.credentials.password
-            });
-        } else if (n.influxdbVersion === VERSION_18_FLUX || n.influxdbVersion === VERSION_20) {
-            const timeout =  Math.floor(+(n.timeout?n.timeout:10)*1000) // convert from seconds to milliseconds
-
-            const token = n.influxdbVersion === VERSION_18_FLUX ?
-                `${this.credentials.username}:${this.credentials.password}` :
-                this.credentials.token;
-
-            clientOptions = {
-                url: n.url,
-                token,
-                timeout,
-                rejectUnauthorized: n.rejectUnauthorized
-            }
-            this.client = new InfluxDB(clientOptions);
-        }
-        this.influxdbVersion = n.influxdbVersion;
+        this.client = new InfluxDB(clientOptions);
     }
 
     RED.nodes.registerType("influxdb", InfluxConfigNode, {
@@ -82,15 +50,6 @@ module.exports = function (RED) {
         return /^-?\d+i$/.test(value);
     }
 
-    function setFieldIntegers(fields) {
-        for (const prop in fields) {
-            const value = fields[prop];
-            if (isIntegerString(value)) {
-                fields[prop] = parseInt(value.substring(0,value.length-1));
-            }
-        }
-    }
-
     function addFieldToPoint(point, name, value) {
         if (name === 'time') {
             point.timestamp(value);
@@ -99,7 +58,7 @@ module.exports = function (RED) {
         } else if (typeof value === 'string') {
             // string values with numbers ending with 'i' are considered integers            
             if (isIntegerString(value)) {
-                value = parseInt(value.substring(0,value.length-1));
+                value = parseInt(value.substring(0, value.length - 1));
                 point.intField(name, value);
             } else {
                 point.stringField(name, value);
@@ -117,7 +76,7 @@ module.exports = function (RED) {
     }
 
     // write using influx-client-js
-    function writePoints(msg, node, done) {
+    function writePoints(msg, /** @type OutNodeType */ node, done) {
         var measurement = msg.hasOwnProperty('measurement') ? msg.measurement : node.measurement;
         if (!measurement) {
             return done(RED._("influxdb.errors.nomeasurement"));
@@ -162,15 +121,15 @@ module.exports = function (RED) {
                     node.client.writePoint(point);
                 }
             }
-    
+
             node.client.flush(true).then(() => {
-                    done();
-                }).catch(error => {
-                    msg.influx_error = {
-                        errorMessage: error
-                    };
-                    done(error);
-                });
+                done();
+            }).catch(error => {
+                msg.influx_error = {
+                    errorMessage: error
+                };
+                done(error);
+            });
         } catch (error) {
             msg.influx_error = {
                 errorMessage: error
@@ -181,6 +140,7 @@ module.exports = function (RED) {
 
     /**
      * Output node to write to a single influxdb measurement
+     * @this OutNodeType
      */
     function InfluxOutNode(n) {
         RED.nodes.createNode(this, n);
@@ -201,114 +161,83 @@ module.exports = function (RED) {
             this.error(RED._("influxdb.errors.missingconfig"));
             return;
         }
-        let version = this.influxdbConfig.influxdbVersion;
-
         var node = this;
 
-        if (version === VERSION_1X) {
-            var client = this.influxdbConfig.client;
+        let bucket = this.bucket;
+        let org = this.org;
+        const context = this.context();
 
-            node.on("input", function (msg, send, done) {
-                var measurement;
-                var writeOptions = {};
-
-                var measurement = msg.hasOwnProperty('measurement') ? msg.measurement : node.measurement;
-                if (!measurement) {
-                    return done(RED._("influxdb.errors.nomeasurement"));
-                }
-                var precision = msg.hasOwnProperty('precision') ? msg.precision : node.precision;
-                var retentionPolicy = msg.hasOwnProperty('retentionPolicy') ? msg.retentionPolicy : node.retentionPolicy;
-
-                if (precision) {
-                    writeOptions.precision = precision;
-                }
-
-                if (retentionPolicy) {
-                    writeOptions.retentionPolicy = retentionPolicy;
-                }
-
-                // format payload to match new writePoints API
-                var points = [];
-                var point;
-                if (_.isArray(msg.payload) && msg.payload.length > 0) {
-                    // array of arrays
-                    if (_.isArray(msg.payload[0]) && msg.payload[0].length > 0) {
-                        msg.payload.forEach(function (nodeRedPoint) {
-                            let fields = _.clone(nodeRedPoint[0])
-                            point = {
-                                measurement: measurement,
-                                fields,
-                                tags: nodeRedPoint[1]
-                            }
-                            setFieldIntegers(point.fields)
-                            if (point.fields.time) {
-                                point.timestamp = point.fields.time;
-                                delete point.fields.time;
-                            }
-                            points.push(point);
-                        });
-                    } else {
-                        // array of non-arrays, assume one point with both fields and tags
-                        let fields = _.clone(msg.payload[0])
-                        point = {
-                            measurement: measurement,
-                            fields,
-                            tags: msg.payload[1]
-                        };
-                        setFieldIntegers(point.fields)
-                        if (point.fields.time) {
-                            point.timestamp = point.fields.time;
-                            delete point.fields.time;
-                        }
-                        points.push(point);
-                    }
-                } else {
-                    // fields only
-                    if (_.isPlainObject(msg.payload)) {
-                        let fields = _.clone(msg.payload)
-                        point = {
-                            measurement: measurement,
-                            fields,
-                        };
-                        setFieldIntegers(point.fields)
-                        if (point.fields.time) {
-                            point.timestamp = point.fields.time;
-                            delete point.fields.time;
-                        }
-                    } else {
-                        // just a value
-                        point = {
-                            measurement: measurement,
-                            fields: { value: msg.payload }
-                        };
-                        setFieldIntegers(point.fields)
-                    }
-                    points.push(point);
-                }
-
-                client.writePoints(points, writeOptions).then(() => {
-                    done();
-                }).catch(function (err) {
-                    msg.influx_error = {
-                        statusCode: err.res ? err.res.statusCode : 503
-                    }
-                    done(err);
+        function readAllKeys() {
+            return new Promise((resolve, reject) => {
+                node.context().keys((err, keys) => {
+                    if (err) reject(err);
+                    else resolve(keys);
                 });
             });
-        } else if (version === VERSION_18_FLUX || version === VERSION_20) {
-            let bucket = this.bucket;
-            if (version === VERSION_18_FLUX) {
-                let retentionPolicy = this.retentionPolicyV18Flux ? this.retentionPolicyV18Flux : 'autogen';
-                bucket = `${this.database}/${retentionPolicy}`;
-            }
-            let org = version === VERSION_18_FLUX ? '' : this.org;
+        }
 
-            this.client = this.influxdbConfig.client.getWriteApi(org, bucket, this.precisionV18FluxV20);
-
-            node.on("input", function (msg, send, done) {
-                writePoints(msg, node, done);
+        function readValue(key) {
+            return new Promise((resolve, reject) => {
+                node.context().get(key, (err, value) => {
+                    if (err) reject(err);
+                    else resolve(value);
+                });
             });
         }
+
+        let suspend = false;
+
+        const resendAllData = async () => {
+            try {
+                if (suspend) {
+                    return;
+                }
+                suspend = true;
+
+                const keys = await readAllKeys();
+                if (!keys.length) {
+                    return;
+                }
+
+                for (const key of keys) {
+                    const lines = await readValue(key);
+                    context.set(key);
+                    this.client.writeRecords(lines);
+                }
+
+                await this.client.flush(true);
+
+            } finally {
+                suspend = false;
+            }
+        }
+
+        function getHash(lines) {
+            const hash = crypto.createHash('md5');
+            lines.forEach(l => hash.update(l));
+            return hash.digest('hex');
+        }
+
+
+        this.client = this.influxdbConfig.client.getWriteApi(org, bucket, this.precisionV18FluxV20, {
+            writeFailed: (_error, lines) => {
+                context.set(getHash(lines), lines);
+                return Promise.resolve();
+            },
+            writeSuccess: () => {
+                resendAllData().catch();
+            },
+        });
+
+        node.on("input", function (msg, send, done) {
+            writePoints(msg, node, done);
+        });
+
+        node.on('close', function (done) {
+            node.client.close()
+                .then(() => done())
+                .catch(err => done(err));
+        });
     }
 
     RED.nodes.registerType("influxdb out", InfluxOutNode);
@@ -319,6 +248,8 @@ module.exports = function (RED) {
     function InfluxBatchNode(n) {
         RED.nodes.createNode(this, n);
         this.influxdb = n.influxdb;
+
+        /** @type InfluxConfigNode */
         this.influxdbConfig = RED.nodes.getNode(this.influxdb);
         this.precision = n.precision;
         this.retentionPolicy = n.retentionPolicy;
@@ -335,76 +266,48 @@ module.exports = function (RED) {
             this.error(RED._("influxdb.errors.missingconfig"));
             return;
         }
-        let version = this.influxdbConfig.influxdbVersion;
-
         var node = this;
+        let bucket = node.bucket;
+        let org = this.org;
 
-        if (version === VERSION_1X) {
-            var client = this.influxdbConfig.client;
+        var client = this.influxdbConfig.client.getWriteApi(org, bucket, this.precisionV18FluxV20);
 
-            node.on("input", function (msg, send, done) {
-                var writeOptions = {};
-                var precision = msg.hasOwnProperty('precision') ? msg.precision : node.precision;
-                var retentionPolicy = msg.hasOwnProperty('retentionPolicy') ? msg.retentionPolicy : node.retentionPolicy;
+        node.on("input", function (msg, send, done) {
 
-                if (precision) {
-                    writeOptions.precision = precision;
+            msg.payload.forEach(element => {
+                let point = new Point(element.measurement);
+
+                // time is reserved as a field name still! will be overridden by the timestamp below.
+                addFieldsToPoint(point, element.fields);
+
+                let tags = element.tags;
+                if (tags) {
+                    for (const prop in tags) {
+                        point.tag(prop, tags[prop]);
+                    }
                 }
-
-                if (retentionPolicy) {
-                    writeOptions.retentionPolicy = retentionPolicy;
+                if (element.timestamp) {
+                    point.timestamp(element.timestamp);
                 }
-
-                client.writePoints(msg.payload, writeOptions).then(() => {
-                    done();
-                }).catch(function (err) {
-                    msg.influx_error = {
-                        statusCode: err.res ? err.res.statusCode : 503
-                    }
-                    done(err);
-                });
+                client.writePoint(point);
             });
-        } else if (version === VERSION_18_FLUX || version === VERSION_20) {
-            let bucket = node.bucket;
-            if (version === VERSION_18_FLUX) {
-                let retentionPolicy = this.retentionPolicyV18Flux ? this.retentionPolicyV18Flux : 'autogen';
-                bucket = `${this.database}/${retentionPolicy}`;
-            }
-            let org = version === VERSION_18_FLUX ? '' : this.org;
 
-            var client = this.influxdbConfig.client.getWriteApi(org, bucket, this.precisionV18FluxV20);
-
-            node.on("input", function (msg, send, done) {
-
-                msg.payload.forEach(element => {
-                    let point = new Point(element.measurement);
-        
-                    // time is reserved as a field name still! will be overridden by the timestamp below.
-                    addFieldsToPoint(point, element.fields);
-
-                    let tags = element.tags;
-                    if (tags) {
-                        for (const prop in tags) {
-                            point.tag(prop, tags[prop]);
-                        }
-                    }
-                    if (element.timestamp) {
-                        point.timestamp(element.timestamp);
-                    }
-                    client.writePoint(point);
-                });
-
-                // ensure we write everything including scheduled retries
-                client.flush(true).then(() => {
-                        done();
-                    }).catch(error => {
-                        msg.influx_error = {
-                            errorMessage: error
-                        };
-                        done(error);
-                    });
+            // ensure we write everything including scheduled retries
+            client.flush(true).then(() => {
+                done();
+            }).catch(error => {
+                msg.influx_error = {
+                    errorMessage: error
+                };
+                done(error);
             });
-        }
+        });
+
+        node.on('close', function (done) {
+            client.close()
+                .then(() => done())
+                .catch(err => done(err));
+        });
     }
 
     RED.nodes.registerType("influxdb batch", InfluxBatchNode);
@@ -419,6 +322,7 @@ module.exports = function (RED) {
         this.precision = n.precision;
         this.retentionPolicy = n.retentionPolicy;
         this.rawOutput = n.rawOutput;
+        /** @type InfluxConfigNode */
         this.influxdbConfig = RED.nodes.getNode(this.influxdb);
         this.org = n.org;
 
@@ -427,83 +331,34 @@ module.exports = function (RED) {
             return;
         }
 
-        let version = this.influxdbConfig.influxdbVersion
-        if (version === VERSION_1X) {
-            var node = this;
-            var client = this.influxdbConfig.client;
+        let org = this.org;
+        this.client = this.influxdbConfig.client.getQueryApi(org);
+        var node = this;
 
-            node.on("input", function (msg, send, done) {
-                var query;
-                var rawOutput;
-                var queryOptions = {};
-                var precision;
-                var retentionPolicy;
-
-                query = msg.hasOwnProperty('query') ? msg.query : node.query;
-                if (!query) {
-                    return done(RED._("influxdb.errors.noquery"));
-                }
-
-                rawOutput = msg.hasOwnProperty('rawOutput') ? msg.rawOutput : node.rawOutput;
-                precision = msg.hasOwnProperty('precision') ? msg.precision : node.precision;
-                retentionPolicy = msg.hasOwnProperty('retentionPolicy') ? msg.retentionPolicy : node.retentionPolicy;
-
-                if (precision) {
-                    queryOptions.precision = precision;
-                }
-
-                if (retentionPolicy) {
-                    queryOptions.retentionPolicy = retentionPolicy;
-                }
-
-                if (rawOutput) {
-                    var queryPromise = client.queryRaw(query, queryOptions);
-                } else {
-                    var queryPromise = client.query(query, queryOptions);
-                }
-
-                queryPromise.then(function (results) {
-                    msg.payload = results;
+        node.on("input", function (msg, send, done) {
+            var query = msg.hasOwnProperty('query') ? msg.query : node.query;
+            if (!query) {
+                return done(RED._("influxdb.errors.noquery"));
+            }
+            var output = [];
+            node.client.queryRows(query, {
+                next(row, tableMeta) {
+                    var o = tableMeta.toObject(row)
+                    output.push(o);
+                },
+                error(error) {
+                    msg.influx_error = {
+                        errorMessage: error
+                    };
+                    done(error);
+                },
+                complete() {
+                    msg.payload = output;
                     send(msg);
                     done();
-                }).catch(function (err) {
-                    msg.influx_error = {
-                        statusCode: err.res ? err.res.statusCode : 503
-                    }
-                    done(err);
-                });
+                },
             });
-
-        } else if (version === VERSION_18_FLUX || version === VERSION_20) {
-            let org = version === VERSION_20 ? this.org : ''
-            this.client = this.influxdbConfig.client.getQueryApi(org);
-            var node = this;
-
-            node.on("input", function (msg, send, done) {
-                var query = msg.hasOwnProperty('query') ? msg.query : node.query;
-                if (!query) {
-                    return done(RED._("influxdb.errors.noquery"));
-                }
-                var output = [];
-                node.client.queryRows(query, {
-                    next(row, tableMeta) {
-                        var o = tableMeta.toObject(row)
-                        output.push(o);
-                    },
-                    error(error) {
-                        msg.influx_error = {
-                            errorMessage: error
-                        };
-                        done(error);
-                    },
-                    complete() {
-                        msg.payload = output;
-                        send(msg);
-                        done();
-                    },
-                });
-            });
-        }
+        });
     }
 
     RED.nodes.registerType("influxdb in", InfluxInNode);

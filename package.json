@@ -1,5 +1,5 @@
 {
-  "name": "node-red-contrib-influxdb",
+  "name": "@andrei-tatar/node-red-contrib-influxdb",
   "version": "0.7.0",
   "description": "Node-RED nodes to save and query data from an influxdb time series database",
   "main": "influxdb.js",
@@ -8,7 +8,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mblackstock/node-red-contrib-influxdb"
+    "url": "https://github.com/andrei-tatar/node-red-contrib-influxdb"
   },
   "contributors": [
     {
@@ -19,6 +19,10 @@
     {
       "name": "Alberto Armijo",
       "email": "alberto.arm@gmail.com"
+    },
+    {
+      "name": "Andrei Tatar",
+      "email": "tatarandrei@gmail.com"
     }
   ],
   "license": "Apache-2.0",
@@ -32,7 +36,6 @@
     }
   },
   "dependencies": {
-    "influx": "~5.9.3",
     "@influxdata/influxdb-client": "~1.33.2",
     "lodash": "~4.17.21"
   },

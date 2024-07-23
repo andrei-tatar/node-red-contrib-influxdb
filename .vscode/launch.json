@@ -1,0 +1,13 @@
+{
+    "configurations": [
+        {
+            "name": "Launch Program",
+            "program": "${workspaceFolder}/../node-red/node_modules/.bin/node-red",
+            "request": "launch",
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "type": "node"
+        }
+    ]
+}
